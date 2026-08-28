@@ -39,9 +39,34 @@ func normalizeTabGroups() async throws {
             try await dissolve(members)
             continue
         }
-        // No member on screen: the whole app is off screen (lock screen, display sleep, Space
-        // transition, cmd+H). Nothing is knowable, so change nothing
-        guard let front = onScreen.first else { continue }
+        guard let front = onScreen.first else {
+            // No *member* is on screen. Two very different situations, and they need opposite handling.
+            //
+            // If some other window of the same app is on screen, it is the group's real front tab and
+            // it is holding the slot — the members were matched to each other without it, which is what
+            // happens when the front tab is corner-parked on a hidden workspace, or when a minimized
+            // tab group is restored and the fronted tab's frame no longer matches its siblings. Every
+            // member is then a background tab, and a background tab must never hold a slot of its own.
+            //
+            // If nothing of the app is on screen, the whole app is off screen (lock screen, display
+            // sleep, cmd+H) and nothing is knowable, so change nothing.
+            //
+            // Known open case: a group on another macOS Space has a genuinely off-screen front tab, so
+            // an unrelated on-screen window of the same app makes this true and parks the whole group,
+            // leaving it holding no slot. It recovers when that Space is visited
+            let pid = members.first?.app.pid
+            let appHasOnScreenWindow = MacWindow.allWindows.contains {
+                $0.app.pid == pid && getWindowLevel(for: $0.windowId) != nil
+            }
+            if appHasOnScreenWindow {
+                for member in members
+                    where member.parent != nil && member.parent !== macosPopupWindowsContainer
+                {
+                    park(member)
+                }
+            }
+            continue
+        }
 
         // members comes from allWindowsMap.values, whose order is not stable between runs. Every
         // selection here has to be deterministic or the group's slot moves at random
@@ -56,7 +81,8 @@ func normalizeTabGroups() async throws {
                 // It also means `front` inherits the holder's workspace for free
                 let slot = holder.unbindFromParent()
                 front.bind(to: slot.parent, adaptiveWeight: slot.adaptiveWeight, index: slot.index)
-                holder.bind(to: macosPopupWindowsContainer, adaptiveWeight: WEIGHT_DOESNT_MATTER, index: INDEX_BIND_LAST)
+                front.parkedFromWorkspace = nil
+                park(holder)
             }
         } else {
             // The group holds no slot at all (every member was parked). Give the front tab a normal one
@@ -64,9 +90,7 @@ func normalizeTabGroups() async throws {
         }
 
         for member in members where member.windowId != front.windowId {
-            if member.parent != nil && member.parent !== macosPopupWindowsContainer {
-                member.bind(to: macosPopupWindowsContainer, adaptiveWeight: WEIGHT_DOESNT_MATTER, index: INDEX_BIND_LAST)
-            }
+            if member.parent != nil && member.parent !== macosPopupWindowsContainer { park(member) }
         }
     }
 }
@@ -80,6 +104,7 @@ private func dissolve(_ members: [MacWindow]) async throws {
         if member.parent === macosPopupWindowsContainer {
             try await member.relayoutWindow(on: workspace, .cancellable, forceTile: true)
         }
+        member.parkedFromWorkspace = nil
     }
 }
 
@@ -88,10 +113,21 @@ private func dissolve(_ members: [MacWindow]) async throws {
 /// that lives on another workspace over to the focused one is not
 @MainActor
 private func tabGroupWorkspace(_ members: [MacWindow]) -> Workspace {
-    members.sorted { $0.windowId < $1.windowId }
-        .lazy
-        .compactMap { $0.nodeWorkspace }
-        .first ?? focus.workspace
+    let sorted = members.sorted { $0.windowId < $1.windowId }
+    if let workspace = sorted.lazy.compactMap({ $0.nodeWorkspace }).first { return workspace }
+    // Every member is parked, so none has a nodeWorkspace. Where they were parked from is a far better
+    // answer than whichever workspace the user happens to be looking at
+    if let workspace = sorted.lazy.compactMap({ $0.parkedFromWorkspace }).compactMap({ Workspace.get(byName: $0) }).first {
+        return workspace
+    }
+    return focus.workspace
+}
+
+/// Records the workspace before unbinding, because a parked window has no `nodeWorkspace`
+@MainActor
+private func park(_ window: MacWindow) {
+    if let workspace = window.nodeWorkspace { window.parkedFromWorkspace = workspace.name }
+    window.bind(to: macosPopupWindowsContainer, adaptiveWeight: WEIGHT_DOESNT_MATTER, index: INDEX_BIND_LAST)
 }
 
 extension MacWindow {
@@ -137,58 +173,91 @@ private func formTabGroups() async throws {
             .sorted { $0.windowId < $1.windowId }
         let offScreen = windows.filter { getWindowLevel(for: $0.windowId) == nil }
             .sorted { $0.windowId < $1.windowId }
-        if onScreen.isEmpty || offScreen.isEmpty { continue }
 
-        // Off-screen clusters first. `hideInCorner` moves only the *front* tab of a group to the
-        // corner of a non-visible workspace and never touches the background tabs, so for every group
-        // that isn't on the visible workspace the on-screen partner's frame no longer matches its own
-        // tabs — while the background tabs stay mutually consistent. The cluster is then the evidence,
-        // and it is the only evidence available for hidden workspaces.
-        //
-        // A group formed this way is dormant: normalizeTabGroups changes nothing while no member is on
-        // screen, so it simply waits, and collapses to one slot the moment that workspace is visited
-        var byFrame: [String: [MacWindow]] = [:]
-        for window in offScreen where window.tabGroupId == nil {
-            guard let rect = getWindowBounds(for: window.windowId), rect.width > 0, rect.height > 0 else { continue }
-            // CGWindowList numbers come straight from the window server and carry none of AX's
-            // sub-pixel jitter, so exact bucketing is right here
-            let key = "\(Int(rect.topLeftX))_\(Int(rect.topLeftY))_\(Int(rect.width))_\(Int(rect.height))"
-            byFrame[key, default: []].append(window)
-        }
-        for (_, cluster) in byFrame where cluster.count > 1 {
-            var members: [MacWindow] = []
-            for window in cluster.sorted(by: { $0.windowId < $1.windowId }) {
-                if try await window.isMacosMinimized(.cancellable) { continue }
-                if try await window.isMacosFullscreen(.cancellable) { continue }
-                if window.macAppUnsafe.nsApp.isHidden { continue }
-                members.append(window)
-            }
-            // Two survivors are the minimum evidence. A lone window is never assumed to be a tab
-            guard members.count > 1, let groupId = members.first?.windowId else { continue }
-            for member in members { member.tabGroupId = groupId }
-        }
+        try await matchAgainstFrontTab(onScreen: onScreen, offScreen: offScreen)
+        try await clusterOffScreenTabs(offScreen)
+    }
+}
 
-        for front in onScreen {
-            guard let frontRect = getWindowBounds(for: front.windowId), frontRect.width > 0, frontRect.height > 0 else { continue }
-            // A native-fullscreen window sits on its own Space, and every other window of the app is
-            // off screen because of that rather than because it is a tab. Its frame is the whole
-            // display, so it would not match a tiled sibling anyway — this is belt and braces
-            if try await front.isMacosFullscreen(.cancellable) { continue }
+/// The front tab of a group is on screen and its background tabs are not, so an off-screen window
+/// sharing the on-screen window's exact frame is a tab of that group.
+///
+/// Only works while the group's front tab still reports the group's frame, i.e. on the visible
+/// workspace. `hideInCorner` breaks it everywhere else, which is what ``clusterOffScreenTabs`` covers
+@MainActor
+private func matchAgainstFrontTab(onScreen: [MacWindow], offScreen: [MacWindow]) async throws {
+    if offScreen.isEmpty { return }
+    for front in onScreen {
+        guard let frontRect = getWindowBounds(for: front.windowId), frontRect.width > 0, frontRect.height > 0 else { continue }
+        // A native-fullscreen window sits on its own Space, and the app's other windows are off screen
+        // because of that rather than because they are tabs. Its frame is the whole display, so it
+        // wouldn't match a tiled sibling anyway — this is belt and braces
+        if try await front.isMacosFullscreen(.cancellable) { continue }
 
-            for candidate in offScreen where candidate.tabGroupId == nil {
-                guard let rect = getWindowBounds(for: candidate.windowId),
-                      rect.isApproximatelyEqual(to: frontRect) else { continue }
-                // Only a frame match earns the AX round trips. A minimized window keeps its
-                // pre-minimize frame, which under tiling can legitimately equal the frame of whatever
-                // took its slot, so this check is load-bearing rather than defensive
-                if try await candidate.isMacosMinimized(.cancellable) { continue }
-                if try await candidate.isMacosFullscreen(.cancellable) { continue }
-                if candidate.macAppUnsafe.nsApp.isHidden { continue }
-
-                let groupId = front.tabGroupId ?? front.windowId
-                front.tabGroupId = groupId
-                candidate.tabGroupId = groupId
-            }
+        for candidate in offScreen where candidate.tabGroupId == nil {
+            guard let rect = getWindowBounds(for: candidate.windowId),
+                  rect.isApproximatelyEqual(to: frontRect) else { continue }
+            guard try await isPlausibleBackgroundTab(candidate) else { continue }
+            let groupId = front.tabGroupId ?? front.windowId
+            front.tabGroupId = groupId
+            candidate.tabGroupId = groupId
         }
     }
+}
+
+/// Two or more off-screen windows of one app sharing an exact frame are a tab group.
+///
+/// This is the only evidence available for a group that isn't on the visible workspace: `hideInCorner`
+/// moves the group's *front* tab to the corner every layout pass and never touches the background tabs,
+/// so the front tab's frame stops matching its own siblings while theirs stay mutually consistent.
+///
+/// Deliberately does not require the app to have an on-screen window. Requiring one is what stopped
+/// this from firing when a whole app is off screen, which is the case it exists for.
+///
+/// Must run *after* ``matchAgainstFrontTab``: stamping `tabGroupId` here first would hide every
+/// clustered window from that pass, and a group's own front tab could never join it
+@MainActor
+private func clusterOffScreenTabs(_ offScreen: [MacWindow]) async throws {
+    // While the screen is locked every window drops off the on-screen list, including the ones
+    // hideInCorner parked — and those all share the *same* top-left with their size unchanged, so any
+    // two same-size windows of one app would present byte-identical frames and cluster falsely
+    if offScreen.count < 2 || isScreenLocked { return }
+
+    var byFrame: [String: [MacWindow]] = [:]
+    // `offScreen` was computed before matchAgainstFrontTab ran, so it still lists windows that pass
+    // claimed. The `tabGroupId == nil` filter is what keeps this correct — it is not redundant, and
+    // dropping it reintroduces the bug where a group's front tab can never join its own group
+    for window in offScreen where window.tabGroupId == nil {
+        guard let rect = getWindowBounds(for: window.windowId), rect.width > 0, rect.height > 0 else { continue }
+        // CGWindowList numbers come straight from the window server and carry none of AX's sub-pixel
+        // jitter, so exact bucketing is right here
+        let key = "\(Int(rect.topLeftX))_\(Int(rect.topLeftY))_\(Int(rect.width))_\(Int(rect.height))"
+        byFrame[key, default: []].append(window)
+    }
+
+    for (_, cluster) in byFrame where cluster.count > 1 {
+        var members: [MacWindow] = []
+        for window in cluster.sorted(by: { $0.windowId < $1.windowId }) {
+            if try await isPlausibleBackgroundTab(window) { members.append(window) }
+        }
+        // Two survivors are the minimum evidence. A lone window is never assumed to be a tab
+        guard members.count > 1, let groupId = members.first?.windowId else { continue }
+        for member in members { member.tabGroupId = groupId }
+    }
+}
+
+/// A minimized window keeps its pre-minimize frame, which under tiling can legitimately equal the frame
+/// of whatever took its slot — so this check is load-bearing rather than defensive. Only ever called on
+/// a window that already matched a frame, so the AX round trips are paid rarely
+@MainActor
+private func isPlausibleBackgroundTab(_ window: MacWindow) async throws -> Bool {
+    if try await window.isMacosMinimized(.cancellable) { return false }
+    if try await window.isMacosFullscreen(.cancellable) { return false }
+    return !window.macAppUnsafe.nsApp.isHidden
+}
+
+/// The same check MacApp uses as its second line of defence against the lock screen
+@MainActor
+private var isScreenLocked: Bool {
+    NSWorkspace.shared.frontmostApplication?.bundleIdentifier == lockScreenAppBundleId
 }

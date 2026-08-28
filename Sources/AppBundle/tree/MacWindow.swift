@@ -26,11 +26,13 @@ final class MacWindow: Window {
         // It joins a tab group that already occupies a slot in the layout, so on-window-detected
         // callbacks must not run for it. https://github.com/nikitabobko/AeroSpace/issues/68
         let tabGroupMembership = try await classifyTabGroupMembership(windowId: windowId, macApp: macApp)
-        // A window that joins a tab group, and a window not yet classifiable, are both kept out of the
-        // layout. For the join that is because the group already owns a slot; for the undecided case it
-        // is because being tiled would let the layout pass at the end of this session move it and its
-        // sibling apart, and the frame match that identifies a tab would then never succeed again
-        let data: BindingData = if tabGroupMembership.isJoin || tabGroupMembership.isUndecided {
+        // A window that joins a tab group is kept out of the layout, because the group already owns a
+        // slot. A window that is merely not classifiable *yet* is laid out normally: hiding it in the
+        // popup container makes it invisible to the whole window manager if the deferred resolution
+        // never completes, which is a far worse failure than a tab briefly holding a slot. Its
+        // on-window-detected callbacks are still deferred, and normalizeTabGroups parks it later if it
+        // turns out to be a tab
+        let data: BindingData = if tabGroupMembership.isJoin {
             BindingData(parent: macosPopupWindowsContainer, adaptiveWeight: WEIGHT_DOESNT_MATTER, index: INDEX_BIND_LAST)
         } else {
             try await unbindAndGetBindingDataForNewWindow(
@@ -345,11 +347,20 @@ func resolveDeferredWindowDetection() async throws {
             continue
         }
         // Claim the entry before the first suspension point, or two overlapping sessions can both get
-        // past the classification and both run the callbacks
+        // past the classification and both run the callbacks. But put it back if this iteration does
+        // not finish: refresh sessions are cancelled constantly (every AX notification cancels the one
+        // in flight), and a dropped entry means the window is never classified and never gets its
+        // callbacks
         windowsPendingDetection.removeValue(forKey: windowId)
+        var resolved = false
+        // Note the restore writes back `sessions`, not sessions + 1, so a window whose session is
+        // cancelled every time never advances its counter. maxDeferredDetectionSessions therefore
+        // bounds completed classification attempts, not total ones
+        defer { if !resolved { windowsPendingDetection[windowId] = sessions } }
         let membership = try await MacWindow.classifyTabGroupMembership(windowId: windowId, macApp: window.macApp)
         if membership.isUndecided && sessions < maxDeferredDetectionSessions {
             windowsPendingDetection[windowId] = sessions + 1
+            resolved = true
             continue
         }
         if case .joinsTabGroup(let sibling) = membership {
@@ -357,6 +368,7 @@ func resolveDeferredWindowDetection() async throws {
             let groupId = sibling.tabGroupId ?? sibling.windowId
             sibling.tabGroupId = groupId
             window.tabGroupId = groupId
+            resolved = true
             continue // normalizeTabGroups hands the group's slot to whichever member is on screen
         }
         // Unconditional and never gated — see the note in getOrRegister. Redundant with the call made
@@ -374,6 +386,7 @@ func resolveDeferredWindowDetection() async throws {
             try await window.relayoutWindow(on: workspace, .cancellable)
         }
         if !restoredFrozenWorld { await tryOnWindowDetected(window) }
+        resolved = true
     }
 }
 

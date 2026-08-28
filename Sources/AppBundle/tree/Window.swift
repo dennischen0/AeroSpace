@@ -10,6 +10,9 @@ open class Window: TreeNode, Hashable {
     var layoutReason: LayoutReason = .standard
     /// Non-nil once this window was observed joining a native macOS tab group. See ``normalizeTabGroups()``
     var tabGroupId: UInt32?
+    /// Workspace this window was parked out of, remembered because a parked window has no
+    /// `nodeWorkspace` and the focused workspace is a bad guess. See ``normalizeTabGroups()``
+    var parkedFromWorkspace: String?
 
     @MainActor
     init(id: UInt32, _ app: any AbstractApp, lastFloatingSize: CGSize?, parent: NonLeafTreeNodeObject, adaptiveWeight: CGFloat, index: Int) {
