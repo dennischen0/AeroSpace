@@ -14,7 +14,10 @@ private var isCacheFresh = false
 /// because absence from a cache that is merely "fresh for this session" is otherwise indistinguishable
 /// from a window that appeared after the last query
 @MainActor
-func invalidateWindowLevelCache() { isCacheFresh = false }
+func invalidateWindowLevelCache() {
+    isCacheFresh = false
+    isBoundsCacheFresh = false
+}
 
 /// `nil` means that the window is absent from the on-screen window list. See ``normalizeTabGroups()``
 ///
@@ -26,6 +29,40 @@ func getWindowLevel(for windowId: UInt32) -> MacOsWindowLevel? {
     return cache[windowId]
 }
 
+
+/// Frames of *all* windows, on screen or not. The window server reports these for background native
+/// tabs too, which lets steady-state tab matching compare frames without a single AX round trip
+@MainActor
+private var boundsCache: [UInt32: Rect] = [:]
+@MainActor
+private var isBoundsCacheFresh = false
+
+@MainActor
+func getWindowBounds(for windowId: UInt32) -> Rect? {
+    if !isBoundsCacheFresh { refreshBoundsCache() }
+    return boundsCache[windowId]
+}
+
+@MainActor
+private func refreshBoundsCache() {
+    let options = CGWindowListOption(arrayLiteral: .excludeDesktopElements, .optionAll)
+    guard let cfArray = CGWindowListCopyWindowInfo(options, CGWindowID(0)) as? [CFDictionary] else { return }
+    var result: [UInt32: Rect] = [:]
+    for elem in cfArray {
+        let dict = elem as NSDictionary
+        guard let _windowId = dict[kCGWindowNumber] else { continue }
+        let windowId = ((_windowId as! CFNumber) as NSNumber).uint32Value
+        guard let bounds = dict[kCGWindowBounds] as? NSDictionary,
+              let x = (bounds["X"] as? NSNumber)?.doubleValue,
+              let y = (bounds["Y"] as? NSNumber)?.doubleValue,
+              let width = (bounds["Width"] as? NSNumber)?.doubleValue,
+              let height = (bounds["Height"] as? NSNumber)?.doubleValue
+        else { continue }
+        result[windowId] = Rect(topLeftX: x, topLeftY: y, width: width, height: height)
+    }
+    boundsCache = result
+    isBoundsCacheFresh = true
+}
 
 @MainActor
 private func refreshCache() {

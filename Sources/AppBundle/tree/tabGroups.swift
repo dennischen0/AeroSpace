@@ -19,6 +19,8 @@ import AppKit
 /// https://github.com/nikitabobko/AeroSpace/issues/68
 @MainActor
 func normalizeTabGroups() async throws {
+    try await formTabGroups()
+
     var groups: [UInt32: [MacWindow]] = [:]
     for window in MacWindow.allWindows {
         if let groupId = window.tabGroupId { groups[groupId, default: []].append(window) }
@@ -111,5 +113,82 @@ extension MacWindow {
         // leaves the heir in its place. The exact adaptive weight is not recoverable without unbinding
         // first, and unbinding here would break the caller's own unbind
         heir.bind(to: parent, adaptiveWeight: WEIGHT_AUTO, index: index)
+    }
+}
+
+/// Membership can only be *established* at creation while a window is on screen, and a background tab
+/// is off screen by definition. So every tab that already existed when its window was registered —
+/// everything open at AeroSpace startup, and everything re-registered after an unlock or a restart —
+/// would never be grouped, and would sit in the layout as a stray window.
+///
+/// This closes that by letting groups form in steady state as well. It is the fail-open direction, so
+/// it carries the same guards that make creation-time matching safe, and one more: frames are compared
+/// using the window server's own numbers rather than AX, so the scan costs nothing until a pair
+/// actually matches
+@MainActor
+private func formTabGroups() async throws {
+    var ungroupedByPid: [Int32: [MacWindow]] = [:]
+    for window in MacWindow.allWindows where window.tabGroupId == nil {
+        ungroupedByPid[window.app.pid, default: []].append(window)
+    }
+
+    for (_, windows) in ungroupedByPid where windows.count > 1 {
+        let onScreen = windows.filter { getWindowLevel(for: $0.windowId) != nil }
+            .sorted { $0.windowId < $1.windowId }
+        let offScreen = windows.filter { getWindowLevel(for: $0.windowId) == nil }
+            .sorted { $0.windowId < $1.windowId }
+        if onScreen.isEmpty || offScreen.isEmpty { continue }
+
+        // Off-screen clusters first. `hideInCorner` moves only the *front* tab of a group to the
+        // corner of a non-visible workspace and never touches the background tabs, so for every group
+        // that isn't on the visible workspace the on-screen partner's frame no longer matches its own
+        // tabs — while the background tabs stay mutually consistent. The cluster is then the evidence,
+        // and it is the only evidence available for hidden workspaces.
+        //
+        // A group formed this way is dormant: normalizeTabGroups changes nothing while no member is on
+        // screen, so it simply waits, and collapses to one slot the moment that workspace is visited
+        var byFrame: [String: [MacWindow]] = [:]
+        for window in offScreen where window.tabGroupId == nil {
+            guard let rect = getWindowBounds(for: window.windowId), rect.width > 0, rect.height > 0 else { continue }
+            // CGWindowList numbers come straight from the window server and carry none of AX's
+            // sub-pixel jitter, so exact bucketing is right here
+            let key = "\(Int(rect.topLeftX))_\(Int(rect.topLeftY))_\(Int(rect.width))_\(Int(rect.height))"
+            byFrame[key, default: []].append(window)
+        }
+        for (_, cluster) in byFrame where cluster.count > 1 {
+            var members: [MacWindow] = []
+            for window in cluster.sorted(by: { $0.windowId < $1.windowId }) {
+                if try await window.isMacosMinimized(.cancellable) { continue }
+                if try await window.isMacosFullscreen(.cancellable) { continue }
+                if window.macAppUnsafe.nsApp.isHidden { continue }
+                members.append(window)
+            }
+            // Two survivors are the minimum evidence. A lone window is never assumed to be a tab
+            guard members.count > 1, let groupId = members.first?.windowId else { continue }
+            for member in members { member.tabGroupId = groupId }
+        }
+
+        for front in onScreen {
+            guard let frontRect = getWindowBounds(for: front.windowId), frontRect.width > 0, frontRect.height > 0 else { continue }
+            // A native-fullscreen window sits on its own Space, and every other window of the app is
+            // off screen because of that rather than because it is a tab. Its frame is the whole
+            // display, so it would not match a tiled sibling anyway — this is belt and braces
+            if try await front.isMacosFullscreen(.cancellable) { continue }
+
+            for candidate in offScreen where candidate.tabGroupId == nil {
+                guard let rect = getWindowBounds(for: candidate.windowId),
+                      rect.isApproximatelyEqual(to: frontRect) else { continue }
+                // Only a frame match earns the AX round trips. A minimized window keeps its
+                // pre-minimize frame, which under tiling can legitimately equal the frame of whatever
+                // took its slot, so this check is load-bearing rather than defensive
+                if try await candidate.isMacosMinimized(.cancellable) { continue }
+                if try await candidate.isMacosFullscreen(.cancellable) { continue }
+                if candidate.macAppUnsafe.nsApp.isHidden { continue }
+
+                let groupId = front.tabGroupId ?? front.windowId
+                front.tabGroupId = groupId
+                candidate.tabGroupId = groupId
+            }
+        }
     }
 }

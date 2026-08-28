@@ -277,7 +277,7 @@ final class MacWindow: Window {
     }
 }
 
-private extension Rect {
+extension Rect {
     /// AX reports tab frames with sub-pixel jitter, so exact equality is too strict
     func isApproximatelyEqual(to other: Rect) -> Bool {
         abs(topLeftX - other.topLeftX) < 2 && abs(topLeftY - other.topLeftY) < 2 &&
