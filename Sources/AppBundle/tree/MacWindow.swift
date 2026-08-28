@@ -19,23 +19,50 @@ final class MacWindow: Window {
     static func getOrRegister(windowId: UInt32, macApp: MacApp) async throws -> MacWindow {
         if let existing = allWindowsMap[windowId] { return existing }
         let rect = try await macApp.getAxRect(windowId, .cancellable)
-        let data = try await unbindAndGetBindingDataForNewWindow(
-            windowId,
-            macApp,
-            isStartup
-                ? (rect?.center.monitorApproximation ?? mainMonitorInfo).activeWorkspace
-                : focus.workspace,
-            window: nil,
-            .cancellable,
-        )
+        // Parked, not tiled, so a vacating sibling can hand over its slot by set membership rather than
+        // by frame match. normalizeNativeTabs decides which it is. Skipped at startup: cost, and nothing
+        // registered then can be joining a tracked group
+        // Requires a tracked sibling: the app's *first* window can't be joining a group, so it is tiled
+        // immediately rather than parked for a pass. Asks whether any sibling is tracked, not whether one
+        // has been demoted, so unlike a vacating-sibling test it doesn't depend on the ~30ms ordering
+        let hasTrackedSibling = allWindows.contains { $0.app.pid == macApp.pid && $0.windowId != windowId }
+        var looksTabbed = false
+        if !isStartup, hasTrackedSibling {
+            looksTabbed = try await macApp.nativeTabCount(windowId, .cancellable).map { $0 >= 2 } == true
+        }
+        let data: BindingData = if looksTabbed {
+            BindingData(parent: macosPopupWindowsContainer, adaptiveWeight: WEIGHT_DOESNT_MATTER, index: INDEX_BIND_LAST)
+        } else {
+            try await unbindAndGetBindingDataForNewWindow(
+                windowId,
+                macApp,
+                isStartup
+                    ? (rect?.center.monitorApproximation ?? mainMonitorInfo).activeWorkspace
+                    : focus.workspace,
+                window: nil,
+                .cancellable,
+            )
+        }
 
         // atomic synchronous section
         if let existing = allWindowsMap[windowId] { return existing }
         let window = MacWindow(windowId, macApp, lastFloatingSize: rect?.size, parent: data.parent, adaptiveWeight: data.adaptiveWeight, index: data.index)
         allWindowsMap[windowId] = window
+        if looksTabbed { window.isParkedNativeTab = true }
 
         try await debugWindowsIfRecording(window, .cancellable)
-        if try await !restoreClosedWindowsCacheIfNeeded(newlyDetectedWindow: window) {
+        // restoreClosedWindowsCacheIfNeeded must run for every registration and must never be gated on
+        // anything: it is the first line of defence against the lock screen, and restoreTreeRecursive
+        // bails out mid-tree when a window isn't registered yet, so the frozen world is only fully
+        // restored by the pass that registers the last window
+        let restoredFrozenWorld = try await restoreClosedWindowsCacheIfNeeded(newlyDetectedWindow: window)
+        // The frozen snapshot is authoritative: if it placed this window it is not parked and owes no
+        // callback. Without this, unlock leaves a restored window marked parked while holding a slot, and
+        // normalizeNativeTabs drags it to the focused workspace and re-runs the user's rules
+        if restoredFrozenWorld { window.clearTabParkState() }
+        window.tabCallbackWithheld = looksTabbed && !restoredFrozenWorld
+        // A parked window's callbacks are owed only if normalizeNativeTabs finds it isn't a tab
+        if !restoredFrozenWorld, !looksTabbed {
             await tryOnWindowDetected(window)
         }
         return window
@@ -81,6 +108,7 @@ final class MacWindow: Window {
             return
         }
         if !skipClosedWindowsCache { cacheClosedWindowIfNeeded() }
+        handOverNativeTabSlot()
         let parent = unbindFromParent().parent
         let deadWindowWorkspace = parent.nodeWorkspace
         let focus = focus

@@ -238,6 +238,13 @@ final class MacApp: AbstractApp {
         } ?? [:]
     }
 
+    /// Tabs reported by the window's own native tab bar, or nil if it has none.
+    func nativeTabCount(_ windowId: UInt32, _ cm: CancellationMode) async throws -> Int? {
+        try await withWindow(windowId, cm) { window, job in
+            try findNativeTabCount(window, job)
+        }
+    }
+
     func getAxTitle(_ windowId: UInt32, _ cm: CancellationMode) async throws -> String? {
         try await withWindow(windowId, cm) { window, job in
             window.get(Ax.titleAttr)
@@ -297,13 +304,17 @@ final class MacApp: AbstractApp {
         }
     }
 
+    /// Window ids listed by `AXWindows` at the last refresh. A tracked window missing from this set is a
+    /// background tab. Empty means unobservable (lock screen), not "no windows"
+    private(set) var axWindowIds: Set<UInt32> = []
+
     private func refreshAndGetAliveWindowIds(frontmostAppBundleId: String?) async throws -> [UInt32] {
         if nsApp.isTerminated {
             await destroy()
             return []
         }
         guard let thread else { return [] }
-        let (alive, dead) = try await thread.runInLoop(.cancellable) { [nsApp, windows, axApp] (job) -> ([UInt32], [UInt32]) in
+        let (alive, dead, axWindowIds) = try await thread.runInLoop(.cancellable) { [nsApp, windows, axApp] (job) -> ([UInt32], [UInt32], Set<UInt32>) in
             var alive: [UInt32: AxWindow] = windows.threadGuarded
             var dead = [UInt32: AxWindow]()
             // Second line of defence against lock screen. See the first line of defence: closedWindowsCache
@@ -315,14 +326,20 @@ final class MacApp: AbstractApp {
                 }
             }
 
+            // Note that windows absent from AXWindows are deliberately kept in `alive`: their AX
+            // elements are still valid, and a background native tab is exactly such a window. Which
+            // of them AXWindows currently lists is reported separately — see MacApp.axWindowIds
+            var axWindowIds: Set<UInt32> = []
             for (id, window) in axApp.threadGuarded.get(Ax.windowsAttr) ?? [] {
                 try job.checkCancellation()
+                axWindowIds.insert(id)
                 try alive.getOrRegisterAxWindow(windowId: id, window, nsApp, job)
             }
 
             windows.threadGuarded = alive
-            return (Array(alive.keys), Array(dead.keys))
+            return (Array(alive.keys), Array(dead.keys), axWindowIds)
         }
+        self.axWindowIds = axWindowIds
         windowsCount = alive.count
         for windowId in dead {
             setFrameJobs.removeValue(forKey: windowId)?.cancel()
@@ -433,4 +450,34 @@ private func disableAnimations<T>(app: AXUIElement, _ job: RunLoopJob, _ body: (
     }
     try job.checkCancellation()
     return try body()
+}
+
+/// Direct children only, and tabs must have subrole `AXTabButton`. Both qualifiers are load-bearing:
+/// Firefox's browser tabs use the identical role and subrole three levels deeper, RubyMine's editor tabs
+/// two levels deeper. Measured — native tab bars sit at depth 1, content strips deeper.
+private func findNativeTabCount(_ window: AXUIElement, _ job: RunLoopJob) throws -> Int? {
+    try job.checkCancellation()
+    var childrenRaw: AnyObject?
+    guard unsafe AXUIElementCopyAttributeValue(window, kAXChildrenAttribute as CFString, &childrenRaw) == .success,
+          let children = childrenRaw as? [AXUIElement]
+    else { return nil }
+
+    for child in children {
+        try job.checkCancellation()
+        var role: AnyObject?
+        guard unsafe AXUIElementCopyAttributeValue(child, kAXRoleAttribute as CFString, &role) == .success,
+              role as? String == "AXTabGroup"
+        else { continue }
+        var tabsRaw: AnyObject?
+        guard unsafe AXUIElementCopyAttributeValue(child, "AXTabs" as CFString, &tabsRaw) == .success,
+              let tabs = tabsRaw as? [AXUIElement]
+        else { continue }
+        let nativeTabs = tabs.filter { tab in
+            var subrole: AnyObject?
+            return unsafe AXUIElementCopyAttributeValue(tab, kAXSubroleAttribute as CFString, &subrole) == .success
+                && subrole as? String == "AXTabButton"
+        }
+        if !nativeTabs.isEmpty { return nativeTabs.count }
+    }
+    return nil
 }

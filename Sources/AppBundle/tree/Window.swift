@@ -8,6 +8,15 @@ open class Window: TreeNode, Hashable {
     var isFullscreen: Bool = false
     var noOuterGapsInFullscreen: Bool = false
     var layoutReason: LayoutReason = .standard
+    /// Parked by ``normalizeNativeTabs()`` as a background native tab (not a real popup)
+    var isParkedNativeTab: Bool = false
+    /// Normalization passes spent parked. One pass must elapse before it can be judged
+    var tabParkSessions: Int = 0
+    /// Set only at registration, when callbacks were withheld pending the tab question. A tab demoted
+    /// later already fired its callbacks when it was first registered and is owed nothing
+    var tabCallbackWithheld: Bool = false
+    /// Workspace parked out of; a parked window has no `nodeWorkspace`
+    var parkedFromWorkspace: String?
 
     @MainActor
     init(id: UInt32, _ app: any AbstractApp, lastFloatingSize: CGSize?, parent: NonLeafTreeNodeObject, adaptiveWeight: CGFloat, index: Int) {

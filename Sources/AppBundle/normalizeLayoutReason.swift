@@ -5,6 +5,7 @@ func normalizeLayoutReason() async throws {
         try await _normalizeLayoutReason(workspace: workspace, windows: windows)
     }
     try await _normalizeLayoutReason(workspace: focus.workspace, windows: macosMinimizedWindowsContainer.children.filterIsInstance(of: Window.self))
+    try await normalizeNativeTabs()
     try await validateStillPopups()
 }
 
@@ -12,6 +13,8 @@ func normalizeLayoutReason() async throws {
 private func validateStillPopups() async throws {
     for node in macosPopupWindowsContainer.children {
         let popup = (node as! MacWindow)
+        // Parked tabs are not popups; normalizeNativeTabs owns when they come back
+        if popup.isMacosBackgroundTab { continue }
         let windowLevel = getWindowLevel(for: popup.windowId)
         if try await popup.isWindowHeuristic(windowLevel, .cancellable) {
             try await popup.relayoutWindow(on: focus.workspace, .cancellable)
