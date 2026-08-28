@@ -3,14 +3,35 @@ import Foundation
 
 @MainActor
 private var cache: [UInt32: MacOsWindowLevel] = [:]
+@MainActor
+private var isCacheFresh = false
 
+/// Must be called at least once per refresh session. Otherwise, a window that *changed* its
+/// on-screen state (e.g. a native macOS tab that just went to the background) is reported stale
+/// forever, because a cache hit never re-queries the window server.
+///
+/// Callers that must observe a *brand new* window (window detection) have to invalidate explicitly,
+/// because absence from a cache that is merely "fresh for this session" is otherwise indistinguishable
+/// from a window that appeared after the last query
+@MainActor
+func invalidateWindowLevelCache() { isCacheFresh = false }
+
+/// `nil` means that the window is absent from the on-screen window list. See ``normalizeTabGroups()``
+///
+/// The whole list is queried at most once per refresh session: the window server call is expensive
+/// (it returns every window of every app), and absence must not cost an extra call per window
 @MainActor
 func getWindowLevel(for windowId: UInt32) -> MacOsWindowLevel? {
-    if let existing = cache[windowId] { return existing }
+    if !isCacheFresh { refreshCache() }
+    return cache[windowId]
+}
 
-    var result: [UInt32: MacOsWindowLevel] = [:]
+
+@MainActor
+private func refreshCache() {
     let options = CGWindowListOption(arrayLiteral: .excludeDesktopElements, .optionOnScreenOnly)
-    guard let cfArray = CGWindowListCopyWindowInfo(options, CGWindowID(0)) as? [CFDictionary] else { return nil }
+    guard let cfArray = CGWindowListCopyWindowInfo(options, CGWindowID(0)) as? [CFDictionary] else { return }
+    var result: [UInt32: MacOsWindowLevel] = [:]
     for elem in cfArray {
         let dict = elem as NSDictionary
 
@@ -23,7 +44,7 @@ func getWindowLevel(for windowId: UInt32) -> MacOsWindowLevel? {
         result[windowId] = .new(windowLevel: windowLayer)
     }
     cache = result
-    return result[windowId]
+    isCacheFresh = true
 }
 
 enum MacOsWindowLevel: Sendable, Equatable {

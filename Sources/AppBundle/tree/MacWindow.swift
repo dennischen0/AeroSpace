@@ -18,27 +18,104 @@ final class MacWindow: Window {
     @discardableResult
     static func getOrRegister(windowId: UInt32, macApp: MacApp) async throws -> MacWindow {
         if let existing = allWindowsMap[windowId] { return existing }
+        // The on-screen list must include this brand new window before anything reads window levels,
+        // otherwise getWindowLevel returns nil for it and isWindowHeuristic misclassifies it as a popup
+        invalidateWindowLevelCache()
         let rect = try await macApp.getAxRect(windowId, .cancellable)
-        let data = try await unbindAndGetBindingDataForNewWindow(
-            windowId,
-            macApp,
-            isStartup
-                ? (rect?.center.monitorApproximation ?? mainMonitorInfo).activeWorkspace
-                : focus.workspace,
-            window: nil,
-            .cancellable,
-        )
+        // A new native macOS tab appears as a brand new AXWindow, but it is not a new logical window.
+        // It joins a tab group that already occupies a slot in the layout, so on-window-detected
+        // callbacks must not run for it. https://github.com/nikitabobko/AeroSpace/issues/68
+        let tabGroupMembership = try await classifyTabGroupMembership(windowId: windowId, macApp: macApp)
+        // A window that joins a tab group, and a window not yet classifiable, are both kept out of the
+        // layout. For the join that is because the group already owns a slot; for the undecided case it
+        // is because being tiled would let the layout pass at the end of this session move it and its
+        // sibling apart, and the frame match that identifies a tab would then never succeed again
+        let data: BindingData = if tabGroupMembership.isJoin || tabGroupMembership.isUndecided {
+            BindingData(parent: macosPopupWindowsContainer, adaptiveWeight: WEIGHT_DOESNT_MATTER, index: INDEX_BIND_LAST)
+        } else {
+            try await unbindAndGetBindingDataForNewWindow(
+                windowId,
+                macApp,
+                isStartup
+                    ? (rect?.center.monitorApproximation ?? mainMonitorInfo).activeWorkspace
+                    : focus.workspace,
+                window: nil,
+                .cancellable,
+            )
+        }
 
         // atomic synchronous section
         if let existing = allWindowsMap[windowId] { return existing }
         let window = MacWindow(windowId, macApp, lastFloatingSize: rect?.size, parent: data.parent, adaptiveWeight: data.adaptiveWeight, index: data.index)
         allWindowsMap[windowId] = window
+        if case .joinsTabGroup(let sibling) = tabGroupMembership {
+            // Membership is only ever established here, at the one moment it is observable
+            let groupId = sibling.tabGroupId ?? sibling.windowId
+            sibling.tabGroupId = groupId
+            window.tabGroupId = groupId
+        }
 
         try await debugWindowsIfRecording(window, .cancellable)
-        if try await !restoreClosedWindowsCacheIfNeeded(newlyDetectedWindow: window) {
-            await tryOnWindowDetected(window)
+        // Must run on every single registration, and must never be gated on anything: it is the first
+        // line of defence against the lock screen, and restoreTreeRecursive deliberately bails out
+        // mid-tree when a window isn't registered yet, so the frozen world is only fully restored by
+        // the pass that registers the last window
+        let restoredFrozenWorld = try await restoreClosedWindowsCacheIfNeeded(newlyDetectedWindow: window)
+        switch tabGroupMembership {
+            case .joinsTabGroup:
+                break // Not a new logical window. Don't run on-window-detected callbacks for it
+            case .standaloneWindow:
+                if !restoredFrozenWorld { await tryOnWindowDetected(window) }
+            case .undecided:
+                // The window server hasn't committed the new window yet. Decide on a later refresh
+                // session, once its frame exists. See resolveDeferredWindowDetection
+                if !restoredFrozenWorld { windowsPendingDetection[windowId] = 0 }
         }
         return window
+    }
+
+    enum TabGroupMembership {
+        case joinsTabGroup(sibling: MacWindow)
+        case standaloneWindow
+        /// Not observable yet
+        case undecided
+
+        var isJoin: Bool { if case .joinsTabGroup = self { true } else { false } }
+        var isUndecided: Bool { if case .undecided = self { true } else { false } }
+    }
+
+    /// Tabs of one native tab group share the exact frame of the group, which is what links a newly
+    /// appeared AXWindow to the tab it was opened next to.
+    ///
+    /// The link is not observable at the instant the AXWindow appears. Measured on macOS 26: a new
+    /// tab is first reported with a 0x0 frame while the tab it replaces is still listed as on-screen,
+    /// and only once the window server commits the new frame does the replaced tab drop out of the
+    /// on-screen list. Both are consequences of the same commit, so a materialized frame is the
+    /// condition that makes the answer knowable — deciding before that classifies every ⌘T on a
+    /// single-tab window as a brand new window. https://github.com/nikitabobko/AeroSpace/issues/68
+    @MainActor
+    static func classifyTabGroupMembership(windowId: UInt32, macApp: MacApp) async throws -> TabGroupMembership {
+        if isUnitTest { return .standaloneWindow }
+        guard let rect = try await macApp.getAxRect(windowId, .cancellable), rect.width > 0, rect.height > 0 else {
+            return .undecided
+        }
+        // Deliberately NOT Window.tabVisibility. That predicate asks whether some *registered* window
+        // of the app is on screen, and the window being registered here isn't in allWindowsMap yet, so
+        // it can never be its own sibling — which made ⌘T on a single-window app undetectable. At
+        // creation time the on-screen sibling is known: it is this window
+        guard getWindowLevel(for: windowId) != nil else { return .undecided }
+        for candidate in allWindows where candidate.app.pid == macApp.pid && candidate.windowId != windowId {
+            guard getWindowLevel(for: candidate.windowId) == nil else { continue } // Must be off screen
+            // A minimized window is off screen too, and is not a tab
+            if try await candidate.isMacosMinimized(.cancellable) { continue }
+            // Frame equality is the whole signal. There is deliberately no "the app has exactly one
+            // off-screen window" fallback: plenty of apps keep one around, and guessing there silently
+            // suppresses the user's on-window-detected callbacks for genuinely new windows
+            if let candidateRect = try await candidate.getAxRect(.cancellable), candidateRect.isApproximatelyEqual(to: rect) {
+                return .joinsTabGroup(sibling: candidate)
+            }
+        }
+        return .standaloneWindow
     }
 
     // var description: String {
@@ -81,6 +158,7 @@ final class MacWindow: Window {
             return
         }
         if !skipClosedWindowsCache { cacheClosedWindowIfNeeded() }
+        handOverTabGroupSlot()
         let parent = unbindFromParent().parent
         let deadWindowWorkspace = parent.nodeWorkspace
         let focus = focus
@@ -199,6 +277,14 @@ final class MacWindow: Window {
     }
 }
 
+private extension Rect {
+    /// AX reports tab frames with sub-pixel jitter, so exact equality is too strict
+    func isApproximatelyEqual(to other: Rect) -> Bool {
+        abs(topLeftX - other.topLeftX) < 2 && abs(topLeftY - other.topLeftY) < 2 &&
+            abs(width - other.width) < 2 && abs(height - other.height) < 2
+    }
+}
+
 extension Window {
     @MainActor
     func relayoutWindow(on workspace: Workspace, _ cm: CancellationMode, forceTile: Bool = false) async throws {
@@ -237,6 +323,57 @@ private func unbindAndGetBindingDataForNewTilingWindow(_ workspace: Workspace, w
             adaptiveWeight: WEIGHT_AUTO,
             index: INDEX_BIND_LAST,
         )
+    }
+}
+
+/// Windows whose on-window-detected callbacks are deferred because it wasn't yet observable whether
+/// they are a new logical window or a new native tab, and how many sessions each has waited.
+/// See ``MacWindow/classifyTabGroupMembership``
+@MainActor var windowsPendingDetection: [UInt32: Int] = [:]
+
+/// Some apps keep windows that never get a frame at all (Calendar and Firefox each hold 0x0 windows
+/// on this machine), so waiting for one cannot be unbounded
+private let maxDeferredDetectionSessions = 10
+
+/// Runs once per refresh session, so the decision is driven by the app's own event flow rather than by
+/// a fixed delay
+@MainActor
+func resolveDeferredWindowDetection() async throws {
+    for (windowId, sessions) in windowsPendingDetection {
+        guard let window = MacWindow.allWindowsMap[windowId] else {
+            windowsPendingDetection.removeValue(forKey: windowId) // Died before it could be classified
+            continue
+        }
+        // Claim the entry before the first suspension point, or two overlapping sessions can both get
+        // past the classification and both run the callbacks
+        windowsPendingDetection.removeValue(forKey: windowId)
+        let membership = try await MacWindow.classifyTabGroupMembership(windowId: windowId, macApp: window.macApp)
+        if membership.isUndecided && sessions < maxDeferredDetectionSessions {
+            windowsPendingDetection[windowId] = sessions + 1
+            continue
+        }
+        if case .joinsTabGroup(let sibling) = membership {
+            // Membership established late, but at the first moment it was observable
+            let groupId = sibling.tabGroupId ?? sibling.windowId
+            sibling.tabGroupId = groupId
+            window.tabGroupId = groupId
+            continue // normalizeTabGroups hands the group's slot to whichever member is on screen
+        }
+        // Unconditional and never gated — see the note in getOrRegister. Redundant with the call made
+        // at registration only if nothing happened in between, and a lock screen in between is exactly
+        // the case that has to keep working
+        let restoredFrozenWorld = try await restoreClosedWindowsCacheIfNeeded(newlyDetectedWindow: window)
+        // A genuine new window, or one we gave up waiting on. It was kept out of the layout while
+        // undecided, so it needs a real place now — on the same workspace getOrRegister would have
+        // chosen for it, which at startup is its monitor's, not the focused one
+        if window.parent === macosPopupWindowsContainer {
+            let rect = try await window.getAxRect(.cancellable)
+            let workspace = isStartup
+                ? (rect?.center.monitorApproximation ?? mainMonitorInfo).activeWorkspace
+                : focus.workspace
+            try await window.relayoutWindow(on: workspace, .cancellable)
+        }
+        if !restoredFrozenWorld { await tryOnWindowDetected(window) }
     }
 }
 

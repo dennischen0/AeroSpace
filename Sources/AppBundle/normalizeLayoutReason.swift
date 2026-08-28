@@ -1,10 +1,17 @@
 @MainActor
 func normalizeLayoutReason() async throws {
+    // Windows that changed their on-screen state since the previous session (e.g. a native macOS tab
+    // that just went to the background) must not be reported from a stale cache
+    invalidateWindowLevelCache()
+    // Before the park/restore loops: a window resolved as .joinsTabGroup has already been bound into
+    // the layout, and its group would eat two slots until the next session
+    try await resolveDeferredWindowDetection()
     for workspace in Workspace.all {
         let windows: [Window] = workspace.allLeafWindowsRecursive
         try await _normalizeLayoutReason(workspace: workspace, windows: windows)
     }
     try await _normalizeLayoutReason(workspace: focus.workspace, windows: macosMinimizedWindowsContainer.children.filterIsInstance(of: Window.self))
+    try await normalizeTabGroups()
     try await validateStillPopups()
 }
 
@@ -12,6 +19,11 @@ func normalizeLayoutReason() async throws {
 private func validateStillPopups() async throws {
     for node in macosPopupWindowsContainer.children {
         let popup = (node as! MacWindow)
+        // Background tabs and windows still awaiting classification are parked in this container on
+        // purpose — they are not popups, and normalizeTabGroups owns where they go next. Without this
+        // they would be un-parked in the same session that parked them, three lines earlier
+        if popup.tabGroupId != nil || windowsPendingDetection.keys.contains(popup.windowId) { continue }
+        if popup.layoutReason != .standard { continue }
         let windowLevel = getWindowLevel(for: popup.windowId)
         if try await popup.isWindowHeuristic(windowLevel, .cancellable) {
             try await popup.relayoutWindow(on: focus.workspace, .cancellable)

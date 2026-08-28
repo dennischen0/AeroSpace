@@ -46,6 +46,13 @@ func runHeavyCompleteRefreshSession(
             SecureInputPanel.shared.refresh()
             try await normalizeLayoutReason()
             if shouldLayoutWorkspaces { try await layoutWorkspaces() }
+            // Refresh is entirely event-driven — there is no periodic timer anywhere — so a window
+            // waiting to be classified would otherwise sit unresolved on a quiet desktop and the
+            // user's on-window-detected callbacks would silently never run. Queued from a detached
+            // task because scheduleCancellableCompleteRefreshSession cancels activeRefreshTask, which is *this* one
+            if !windowsPendingDetection.isEmpty {
+                Task { @MainActor in scheduleCancellableCompleteRefreshSession(.deferredWindowDetection) }
+            }
         }
     }
     switch res {
